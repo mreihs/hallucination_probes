@@ -119,12 +119,25 @@ def _masked_mse(
 # -------------------------------------------------------------------
 
 
+def _resolve_dtype() -> torch.dtype:
+    """Pick a training dtype that's stable on the current device.
+
+    CPU and MPS: float32 (fp16/bf16 on MPS is flaky, fp16 on CPU is slow).
+    CUDA: bfloat16 when supported.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float32
+
+
 def train(cfg: TrainConfig) -> Path:
     """Run training; return the path to the saved checkpoint directory."""
     torch.manual_seed(cfg.seed)
 
     log.info("Loading model %s", cfg.model_name)
-    model, tokenizer = load_model_and_tokenizer(cfg.model_name)
+    model, tokenizer = load_model_and_tokenizer(
+        cfg.model_name, torch_dtype=_resolve_dtype(),
+    )
     if hasattr(model, "config"):
         try:
             model.config.use_cache = False
