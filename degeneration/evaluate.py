@@ -108,9 +108,15 @@ def evaluate_checkpoint(
     from utils.model_utils import load_model_and_tokenizer
 
     checkpoint_dir = Path(checkpoint_dir)
-    probe_cfg = json.loads((checkpoint_dir / "probe_config.json").read_text())
+    meta_path = checkpoint_dir / "degeneration_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"degeneration_meta.json not found in {checkpoint_dir}; "
+            f"was this checkpoint produced by degeneration.train?"
+        )
+    meta = json.loads(meta_path.read_text())
 
-    resolved_model = model_name or probe_cfg.get("model_name")
+    resolved_model = model_name or meta.get("model_name")
     if resolved_model is None:
         raise ValueError(
             f"Could not infer model_name from {checkpoint_dir}; "
@@ -130,8 +136,8 @@ def evaluate_checkpoint(
         collate_fn=make_collate_fn(
             tokenizer,
             max_length=max_length,
-            window_size=int(probe_cfg.get("window_size", 256)),
-            primary_n=int(probe_cfg.get("primary_n", 1)),
+            window_size=int(meta.get("window_size", 256)),
+            primary_n=int(meta.get("primary_n", 1)),
         ),
     )
 

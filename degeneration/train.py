@@ -269,14 +269,19 @@ def train(cfg: TrainConfig) -> Path:
     )
 
     probe.save(ckpt_dir)
-    # Extend their probe_config.json with fields our CLI needs on load.
-    cfg_path = ckpt_dir / "probe_config.json"
-    probe_cfg = json.loads(cfg_path.read_text())
-    probe_cfg["model_name"] = cfg.model_name
-    probe_cfg["lora_enabled"] = cfg.lora_enabled
-    probe_cfg["window_size"] = cfg.window_size
-    probe_cfg["primary_n"] = cfg.primary_n
-    cfg_path.write_text(json.dumps(probe_cfg, indent=4))
+    # Write our extra metadata to a sidecar file so we don't mutate the
+    # fork's probe_config.json schema.
+    (ckpt_dir / "degeneration_meta.json").write_text(
+        json.dumps(
+            {
+                "model_name": cfg.model_name,
+                "lora_enabled": cfg.lora_enabled,
+                "window_size": cfg.window_size,
+                "primary_n": cfg.primary_n,
+            },
+            indent=2,
+        )
+    )
 
     if use_wandb:
         import wandb

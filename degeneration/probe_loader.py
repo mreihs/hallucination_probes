@@ -33,7 +33,14 @@ def load_probe(
 
 
 def read_probe_config(checkpoint_dir: str | Path) -> dict:
-    """Convenience: read probe_config.json from a checkpoint dir."""
+    """Convenience: read probe_config.json (written by the fork's ValueHeadProbe.save)."""
     return json.loads(
         (Path(checkpoint_dir) / "probe_config.json").read_text()
+    )
+
+
+def read_degeneration_meta(checkpoint_dir: str | Path) -> dict:
+    """Read the sidecar metadata (model_name, window_size, primary_n, ...)."""
+    return json.loads(
+        (Path(checkpoint_dir) / "degeneration_meta.json").read_text()
     )
