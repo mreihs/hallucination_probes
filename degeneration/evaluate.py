@@ -138,6 +138,7 @@ def evaluate_checkpoint(
             max_length=max_length,
             window_size=int(meta.get("window_size", 256)),
             primary_n=int(meta.get("primary_n", 1)),
+            ttr_threshold=meta.get("ttr_threshold"),
         ),
     )
 

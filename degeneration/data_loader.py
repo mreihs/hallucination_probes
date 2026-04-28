@@ -92,18 +92,23 @@ class DegenerationDataset(Dataset):
         max_rows: int | None = None,
         prompt_field: str = "prompt",
         completion_field: str = "generated_text",
+        shuffle_seed: int = 42,
     ) -> "DegenerationDataset":
         """Build a dataset from a HuggingFace Hub dataset.
 
         Streams the requested split into memory and pulls `prompt` /
         `generated_text` fields. Field names are configurable for datasets
         that use a different schema.
+
+        When ``max_rows`` is set, the split is first **shuffled with a fixed
+        seed** and then truncated, so the subsample is uniform-random across
+        the underlying source datasets but still reproducible.
         """
         from datasets import load_dataset
 
         ds = load_dataset(name, split=split)
-        if max_rows is not None:
-            ds = ds.select(range(min(max_rows, len(ds))))
+        if max_rows is not None and max_rows < len(ds):
+            ds = ds.shuffle(seed=shuffle_seed).select(range(max_rows))
         obj = cls.__new__(cls)
         obj.items = [
             DegenerationItem(
@@ -132,16 +137,21 @@ def make_collate_fn(
     max_length: int,
     window_size: int,
     primary_n: int,
+    ttr_threshold: float | None = None,
 ):
     """
     Return a collate function that:
       - tokenises `prompt + completion` (prompt separately to locate the
         completion boundary);
       - produces `input_ids`, `attention_mask` (standard HF shapes);
-      - produces per-token `labels` in [0, 1] = 1 - TTR over the next
-        `window_size` completion tokens, with n-gram size `primary_n`;
-      - produces `label_mask` marking positions where a label is valid
-        (i.e. a token inside the completion AND the forward window fits).
+      - produces per-token `labels` and a matching `label_mask`.
+
+    When ``ttr_threshold`` is None, ``labels[t]`` is the continuous
+    ``1 - TTR(next window_size tokens)`` value (regression target).
+
+    When ``ttr_threshold`` is set (e.g. 0.2), ``labels[t]`` is the binary
+    indicator ``1.0 if TTR(next window) <= ttr_threshold else 0.0`` —
+    i.e. positive class = "the next window is degenerate".
     """
 
     def collate_fn(batch: List[DegenerationItem]) -> Dict[str, torch.Tensor]:
@@ -186,7 +196,12 @@ def make_collate_fn(
                 pos = plen + k
                 if not (r == r):  # NaN check
                     continue
-                labels[i, pos] = r
+                if ttr_threshold is not None:
+                    # rep is 1 - TTR; positive class iff TTR <= threshold
+                    # iff (1 - TTR) >= (1 - threshold).
+                    labels[i, pos] = 1.0 if r >= (1.0 - ttr_threshold) else 0.0
+                else:
+                    labels[i, pos] = r
                 label_mask[i, pos] = 1.0
 
         return {

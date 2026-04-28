@@ -62,6 +62,10 @@ class TrainConfig:
     # Label construction
     window_size: int = 256
     primary_n: int = 1
+    # If set, switch from continuous regression on `1 - TTR` to binary
+    # classification: positive class = TTR(next window) <= ttr_threshold.
+    # Loss becomes BCE-with-logits instead of masked MSE on sigmoid.
+    ttr_threshold: Optional[float] = None
 
     # Optim
     head_lr: float = 5.0e-3
@@ -73,6 +77,7 @@ class TrainConfig:
     # I/O + logging
     output_dir: str = "outputs/probes"
     wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
 
 
@@ -120,6 +125,18 @@ def _masked_mse(
     sq = (preds - labels) ** 2
     denom = label_mask.sum().clamp(min=1.0)
     return (sq * label_mask).sum() / denom
+
+
+def _masked_bce_with_logits(
+    probe_logits: torch.Tensor,  # [B, T]
+    labels: torch.Tensor,        # [B, T] in {0, 1}
+    label_mask: torch.Tensor,    # [B, T]
+) -> torch.Tensor:
+    per_token = F.binary_cross_entropy_with_logits(
+        probe_logits, labels, reduction="none"
+    )
+    denom = label_mask.sum().clamp(min=1.0)
+    return (per_token * label_mask).sum() / denom
 
 
 # -------------------------------------------------------------------
@@ -188,6 +205,7 @@ def train(cfg: TrainConfig) -> Path:
         max_length=cfg.max_length,
         window_size=cfg.window_size,
         primary_n=cfg.primary_n,
+        ttr_threshold=cfg.ttr_threshold,
     )
     if cfg.hf_dataset is not None:
         log.info("Loading HF dataset %s [train=%s, eval=%s]",
@@ -239,6 +257,7 @@ def train(cfg: TrainConfig) -> Path:
     if use_wandb:
         import wandb
         wandb.init(
+            entity=cfg.wandb_entity,
             project=cfg.wandb_project,
             name=cfg.wandb_run_name,
             config=asdict(cfg),
@@ -260,7 +279,10 @@ def train(cfg: TrainConfig) -> Path:
             out = probe(input_ids=input_ids, attention_mask=attention_mask)
             probe_logits = out["probe_logits"].squeeze(-1)  # [B, T]
 
-            loss = _masked_mse(probe_logits, labels, label_mask)
+            if cfg.ttr_threshold is not None:
+                loss = _masked_bce_with_logits(probe_logits, labels, label_mask)
+            else:
+                loss = _masked_mse(probe_logits, labels, label_mask)
 
             optimizer.zero_grad()
             loss.backward()
@@ -272,13 +294,15 @@ def train(cfg: TrainConfig) -> Path:
 
             if use_wandb:
                 import wandb
-                wandb.log({"train/mse": loss.item(), "train/step": global_step})
+                step_loss_name = "bce" if cfg.ttr_threshold is not None else "mse"
+                wandb.log({f"train/{step_loss_name}": loss.item(), "train/step": global_step})
 
         avg = epoch_loss / max(n_batches, 1)
-        log.info("Epoch %d/%d — train MSE: %.5f", epoch + 1, cfg.num_epochs, avg)
+        loss_name = "BCE" if cfg.ttr_threshold is not None else "MSE"
+        log.info("Epoch %d/%d — train %s: %.5f", epoch + 1, cfg.num_epochs, loss_name, avg)
         if use_wandb:
             import wandb
-            wandb.log({"train/epoch_mse": avg, "epoch": epoch + 1})
+            wandb.log({f"train/epoch_{loss_name.lower()}": avg, "epoch": epoch + 1})
 
         # --- per-epoch eval ---------------------------------------
         metrics = evaluate_regression(probe, eval_loader)
@@ -311,6 +335,7 @@ def train(cfg: TrainConfig) -> Path:
                 "lora_enabled": cfg.lora_enabled,
                 "window_size": cfg.window_size,
                 "primary_n": cfg.primary_n,
+                "ttr_threshold": cfg.ttr_threshold,
             },
             indent=2,
         )
