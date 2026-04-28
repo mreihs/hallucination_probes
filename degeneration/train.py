@@ -44,6 +44,9 @@ class TrainConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.0
+    # If None, LoRA is attached to layers 0..probe_layer (inclusive).
+    # Otherwise, exactly the listed layer indices.
+    lora_layers: Optional[List[int]] = None
 
     # Data — either local JSONL paths OR a HuggingFace dataset spec.
     train_data: List[str] = field(default_factory=list)
@@ -160,10 +163,13 @@ def train(cfg: TrainConfig) -> Path:
         p.requires_grad = False
 
     if cfg.lora_enabled:
-        lora_layer_indices = list(range(layer + 1))
+        if cfg.lora_layers is not None:
+            lora_layer_indices = list(cfg.lora_layers)
+        else:
+            lora_layer_indices = list(range(layer + 1))
         log.info(
-            "Attaching LoRA (r=%d, alpha=%d) to layers %d..%d",
-            cfg.lora_rank, cfg.lora_alpha, 0, layer,
+            "Attaching LoRA (r=%d, alpha=%d) to layers %s",
+            cfg.lora_rank, cfg.lora_alpha, lora_layer_indices,
         )
         model = setup_lora_for_layers(
             model,
