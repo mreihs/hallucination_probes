@@ -83,6 +83,37 @@ class DegenerationDataset(Dataset):
                         DegenerationItem(prompt=prompt, completion=completion)
                     )
 
+    @classmethod
+    def from_hf(
+        cls,
+        name: str,
+        split: str = "train",
+        *,
+        max_rows: int | None = None,
+        prompt_field: str = "prompt",
+        completion_field: str = "generated_text",
+    ) -> "DegenerationDataset":
+        """Build a dataset from a HuggingFace Hub dataset.
+
+        Streams the requested split into memory and pulls `prompt` /
+        `generated_text` fields. Field names are configurable for datasets
+        that use a different schema.
+        """
+        from datasets import load_dataset
+
+        ds = load_dataset(name, split=split)
+        if max_rows is not None:
+            ds = ds.select(range(min(max_rows, len(ds))))
+        obj = cls.__new__(cls)
+        obj.items = [
+            DegenerationItem(
+                prompt=row[prompt_field],
+                completion=row[completion_field],
+            )
+            for row in ds
+        ]
+        return obj
+
     def __len__(self) -> int:
         return len(self.items)
 

@@ -45,9 +45,14 @@ class TrainConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.0
 
-    # Data
+    # Data — either local JSONL paths OR a HuggingFace dataset spec.
     train_data: List[str] = field(default_factory=list)
     eval_data: Optional[str] = None
+    hf_dataset: Optional[str] = None
+    hf_train_split: str = "train"
+    hf_eval_split: Optional[str] = "validation"
+    hf_max_train_rows: Optional[int] = None
+    hf_max_eval_rows: Optional[int] = None
     eval_fraction: float = 0.2
     max_length: int = 2048
 
@@ -172,25 +177,47 @@ def train(cfg: TrainConfig) -> Path:
     print_trainable_parameters(probe)
 
     # --- dataset ---------------------------------------------------
-    log.info("Loading train data: %s", cfg.train_data)
-    full_ds = DegenerationDataset(cfg.train_data)
     collate = make_collate_fn(
         tokenizer,
         max_length=cfg.max_length,
         window_size=cfg.window_size,
         primary_n=cfg.primary_n,
     )
-    if cfg.eval_data is not None:
-        train_ds = full_ds
-        eval_ds = DegenerationDataset(cfg.eval_data)
-    else:
-        n_eval = max(1, int(len(full_ds) * cfg.eval_fraction))
-        n_train = len(full_ds) - n_eval
-        train_ds, eval_ds = random_split(
-            full_ds,
-            [n_train, n_eval],
-            generator=torch.Generator().manual_seed(cfg.seed),
+    if cfg.hf_dataset is not None:
+        log.info("Loading HF dataset %s [train=%s, eval=%s]",
+                 cfg.hf_dataset, cfg.hf_train_split, cfg.hf_eval_split)
+        train_ds = DegenerationDataset.from_hf(
+            cfg.hf_dataset,
+            split=cfg.hf_train_split,
+            max_rows=cfg.hf_max_train_rows,
         )
+        if cfg.hf_eval_split is not None:
+            eval_ds = DegenerationDataset.from_hf(
+                cfg.hf_dataset,
+                split=cfg.hf_eval_split,
+                max_rows=cfg.hf_max_eval_rows,
+            )
+        else:
+            n_eval = max(1, int(len(train_ds) * cfg.eval_fraction))
+            n_train = len(train_ds) - n_eval
+            train_ds, eval_ds = random_split(
+                train_ds, [n_train, n_eval],
+                generator=torch.Generator().manual_seed(cfg.seed),
+            )
+    else:
+        log.info("Loading train data: %s", cfg.train_data)
+        full_ds = DegenerationDataset(cfg.train_data)
+        if cfg.eval_data is not None:
+            train_ds = full_ds
+            eval_ds = DegenerationDataset(cfg.eval_data)
+        else:
+            n_eval = max(1, int(len(full_ds) * cfg.eval_fraction))
+            n_train = len(full_ds) - n_eval
+            train_ds, eval_ds = random_split(
+                full_ds,
+                [n_train, n_eval],
+                generator=torch.Generator().manual_seed(cfg.seed),
+            )
     log.info("Train: %d items | Eval: %d items", len(train_ds), len(eval_ds))
 
     train_loader = DataLoader(
