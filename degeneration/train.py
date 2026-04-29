@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
+import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -155,8 +158,48 @@ def _resolve_dtype() -> torch.dtype:
     return torch.float32
 
 
+def _device_info() -> dict:
+    """Capture host/device fingerprint for the run summary."""
+    info: dict = {
+        "hostname": platform.node(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        info["cuda_device_count"] = torch.cuda.device_count()
+        info["cuda_devices"] = [
+            torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+        ]
+        try:
+            info["cuda_version"] = torch.version.cuda
+        except Exception:
+            pass
+    return info
+
+
+def _format_seconds(secs: float) -> str:
+    """Human-readable hh:mm:ss for the summary."""
+    h, rem = divmod(int(secs), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _json_safe(value):
+    """Replace NaN / +Inf / -Inf with None so summary.json is strict-JSON."""
+    import math
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def train(cfg: TrainConfig) -> Path:
     """Run training; return the path to the saved checkpoint directory."""
+    run_start_wall = datetime.now(timezone.utc)
+    run_start = time.monotonic()
     torch.manual_seed(cfg.seed)
 
     log.info("Loading model %s", cfg.model_name)
@@ -266,7 +309,12 @@ def train(cfg: TrainConfig) -> Path:
     device = next(probe.parameters()).device
     global_step = 0
 
+    n_trainable = sum(p.numel() for p in probe.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in probe.parameters())
+    epoch_history: list[dict] = []
+
     for epoch in range(cfg.num_epochs):
+        epoch_t0 = time.monotonic()
         probe.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -312,8 +360,14 @@ def train(cfg: TrainConfig) -> Path:
             import wandb
             wandb.log({f"eval/{k}": v for k, v in metrics.items()})
 
+        epoch_history.append({
+            "epoch": epoch + 1,
+            "train_loss": avg,
+            "eval": metrics,
+            "duration_seconds": round(time.monotonic() - epoch_t0, 2),
+        })
+
     # --- save ------------------------------------------------------
-    from datetime import datetime
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(cfg.output_dir) / ts
     ckpt_dir = out_dir / "checkpoint"
@@ -345,5 +399,38 @@ def train(cfg: TrainConfig) -> Path:
         import wandb
         wandb.finish()
 
-    log.info("Saved probe to %s", ckpt_dir)
+    # Run summary: timing + device + headline metrics. Sits next to config.json
+    # so anyone inspecting outputs/probes/<ts>/ can answer "how long, where,
+    # how well" without parsing logs.
+    duration = time.monotonic() - run_start
+    summary = {
+        "run_started_utc": run_start_wall.isoformat(),
+        "run_finished_utc": datetime.now(timezone.utc).isoformat(),
+        "duration_seconds": round(duration, 2),
+        "duration_hms": _format_seconds(duration),
+        "device": _device_info(),
+        "model_name": cfg.model_name,
+        "probe_layer": layer,
+        "lora_layers": lora_layer_indices if cfg.lora_enabled else None,
+        "loss": "BCE" if cfg.ttr_threshold is not None else "MSE",
+        "ttr_threshold": cfg.ttr_threshold,
+        "trainable_parameters": n_trainable,
+        "total_parameters": n_total,
+        "trainable_fraction": round(n_trainable / max(n_total, 1), 6),
+        "num_train_items": len(train_ds),
+        "num_eval_items": len(eval_ds),
+        "num_epochs": cfg.num_epochs,
+        "batch_size": cfg.batch_size,
+        "max_length": cfg.max_length,
+        "head_lr": cfg.head_lr,
+        "lora_lr": cfg.lora_lr,
+        "epochs": epoch_history,
+        "final_eval": epoch_history[-1]["eval"] if epoch_history else None,
+        "checkpoint_dir": str(ckpt_dir),
+    }
+    (out_dir / "summary.json").write_text(
+        json.dumps(_json_safe(summary), indent=2, allow_nan=False)
+    )
+
+    log.info("Saved probe to %s (took %s)", ckpt_dir, _format_seconds(duration))
     return ckpt_dir
