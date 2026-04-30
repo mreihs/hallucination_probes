@@ -138,6 +138,7 @@ def make_collate_fn(
     window_size: int,
     primary_n: int,
     ttr_threshold: float | None = None,
+    smoothing: bool = False,
 ):
     """
     Return a collate function that:
@@ -149,10 +150,27 @@ def make_collate_fn(
     When ``ttr_threshold`` is None, ``labels[t]`` is the continuous
     ``1 - TTR(next window_size tokens)`` value (regression target).
 
-    When ``ttr_threshold`` is set (e.g. 0.2), ``labels[t]`` is the binary
-    indicator ``1.0 if TTR(next window) <= ttr_threshold else 0.0`` —
+    When ``ttr_threshold`` is set (e.g. 0.2) and ``smoothing`` is False,
+    ``labels[t]`` is the binary indicator
+    ``1.0 if TTR(next window) <= ttr_threshold else 0.0`` —
     i.e. positive class = "the next window is degenerate".
+
+    When ``ttr_threshold`` is set AND ``smoothing`` is True, ``labels[t]`` is
+    the *fraction* of overlapping size-``window_size`` windows containing
+    position ``t`` whose TTR satisfies ``TTR <= ttr_threshold``. Concretely,
+    for a completion of length ``L``, define the binary indicator
+    ``D[s] = 1 if rep[s] >= 1 - ttr_threshold else 0`` for every start ``s``
+    where the window fits (``s <= L - window_size``). The smoothed target is
+    ``mean(D[s] for s in [max(0, t - (window_size - 1)), min(t, L - window_size)])``.
+    Tokens whose valid-window range is empty fall through to ``label_mask=0``.
+    Smoothing requires ``ttr_threshold`` (the average is only meaningful for
+    a binary indicator).
     """
+    if smoothing and ttr_threshold is None:
+        raise ValueError(
+            "smoothing=True requires ttr_threshold to be set: the smoothed "
+            "label is the mean of a binary indicator, which needs a threshold."
+        )
 
     def collate_fn(batch: List[DegenerationItem]) -> Dict[str, torch.Tensor]:
         prompts = [item.prompt for item in batch]
@@ -187,22 +205,47 @@ def make_collate_fn(
             if plen >= seq_len:
                 continue
             completion_ids = input_ids[i, plen:seq_len].tolist()
+            L = len(completion_ids)
             # Per-completion-token labels: 1 - TTR of the next window_size
             # tokens. Positions without a full window get NaN → mask=0.
             rep = sliding_window_repetition(
                 completion_ids, window_size=window_size, n=primary_n,
             )
-            for k, r in enumerate(rep):
-                pos = plen + k
-                if not (r == r):  # NaN check
-                    continue
-                if ttr_threshold is not None:
-                    # rep is 1 - TTR; positive class iff TTR <= threshold
-                    # iff (1 - TTR) >= (1 - threshold).
-                    labels[i, pos] = 1.0 if r >= (1.0 - ttr_threshold) else 0.0
-                else:
-                    labels[i, pos] = r
-                label_mask[i, pos] = 1.0
+
+            if smoothing:
+                # Build the binary indicator D[s] for every valid window
+                # start s ∈ [0, L - window_size]. rep[s] is NaN beyond that.
+                last_start = L - window_size  # may be < 0 for short completions
+                D: List[float] = []
+                for s in range(max(0, last_start + 1)):
+                    r = rep[s]
+                    if not (r == r):  # NaN — no full window at s
+                        D.append(0.0)
+                    else:
+                        D.append(1.0 if r >= (1.0 - ttr_threshold) else 0.0)
+
+                # For each completion-relative token t, average D[s] over the
+                # set of starts whose window contains t and fits in [0, L).
+                for t in range(L):
+                    s_lo = max(0, t - (window_size - 1))
+                    s_hi = min(t, last_start)
+                    if s_hi < s_lo:
+                        continue  # no window contains t and fits → masked
+                    window_vals = D[s_lo : s_hi + 1]
+                    labels[i, plen + t] = sum(window_vals) / len(window_vals)
+                    label_mask[i, plen + t] = 1.0
+            else:
+                for k, r in enumerate(rep):
+                    pos = plen + k
+                    if not (r == r):  # NaN check
+                        continue
+                    if ttr_threshold is not None:
+                        # rep is 1 - TTR; positive class iff TTR <= threshold
+                        # iff (1 - TTR) >= (1 - threshold).
+                        labels[i, pos] = 1.0 if r >= (1.0 - ttr_threshold) else 0.0
+                    else:
+                        labels[i, pos] = r
+                    label_mask[i, pos] = 1.0
 
         return {
             "input_ids": input_ids,

@@ -69,6 +69,11 @@ class TrainConfig:
     # classification: positive class = TTR(next window) <= ttr_threshold.
     # Loss becomes BCE-with-logits instead of masked MSE on sigmoid.
     ttr_threshold: Optional[float] = None
+    # If True (and ttr_threshold is set), produce smoothed [0, 1] targets that
+    # are the fraction of overlapping windows containing the token whose
+    # binary indicator fires. The loss reverts to masked MSE on sigmoid since
+    # BCE only makes sense for {0,1} targets.
+    label_smoothing: bool = False
 
     # Optim
     head_lr: float = 5.0e-3
@@ -249,6 +254,7 @@ def train(cfg: TrainConfig) -> Path:
         window_size=cfg.window_size,
         primary_n=cfg.primary_n,
         ttr_threshold=cfg.ttr_threshold,
+        smoothing=cfg.label_smoothing,
     )
     if cfg.hf_dataset is not None:
         log.info("Loading HF dataset %s [train=%s, eval=%s]",
@@ -327,7 +333,7 @@ def train(cfg: TrainConfig) -> Path:
             out = probe(input_ids=input_ids, attention_mask=attention_mask)
             probe_logits = out["probe_logits"].squeeze(-1)  # [B, T]
 
-            if cfg.ttr_threshold is not None:
+            if cfg.ttr_threshold is not None and not cfg.label_smoothing:
                 loss = _masked_bce_with_logits(probe_logits, labels, label_mask)
             else:
                 loss = _masked_mse(probe_logits, labels, label_mask)
@@ -342,11 +348,15 @@ def train(cfg: TrainConfig) -> Path:
 
             if use_wandb:
                 import wandb
-                step_loss_name = "bce" if cfg.ttr_threshold is not None else "mse"
+                step_loss_name = (
+                    "bce" if cfg.ttr_threshold is not None and not cfg.label_smoothing else "mse"
+                )
                 wandb.log({f"train/{step_loss_name}": loss.item(), "train/step": global_step})
 
         avg = epoch_loss / max(n_batches, 1)
-        loss_name = "BCE" if cfg.ttr_threshold is not None else "MSE"
+        loss_name = (
+            "BCE" if cfg.ttr_threshold is not None and not cfg.label_smoothing else "MSE"
+        )
         log.info("Epoch %d/%d — train %s: %.5f", epoch + 1, cfg.num_epochs, loss_name, avg)
         if use_wandb:
             import wandb
@@ -390,6 +400,7 @@ def train(cfg: TrainConfig) -> Path:
                 "window_size": cfg.window_size,
                 "primary_n": cfg.primary_n,
                 "ttr_threshold": cfg.ttr_threshold,
+                "label_smoothing": cfg.label_smoothing,
             },
             indent=2,
         )
@@ -412,8 +423,9 @@ def train(cfg: TrainConfig) -> Path:
         "model_name": cfg.model_name,
         "probe_layer": layer,
         "lora_layers": lora_layer_indices if cfg.lora_enabled else None,
-        "loss": "BCE" if cfg.ttr_threshold is not None else "MSE",
+        "loss": "BCE" if cfg.ttr_threshold is not None and not cfg.label_smoothing else "MSE",
         "ttr_threshold": cfg.ttr_threshold,
+        "label_smoothing": cfg.label_smoothing,
         "trainable_parameters": n_trainable,
         "total_parameters": n_total,
         "trainable_fraction": round(n_trainable / max(n_total, 1), 6),
