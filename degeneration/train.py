@@ -71,8 +71,8 @@ class TrainConfig:
     ttr_threshold: Optional[float] = None
     # If True (and ttr_threshold is set), produce smoothed [0, 1] targets that
     # are the fraction of overlapping windows containing the token whose
-    # binary indicator fires. The loss reverts to masked MSE on sigmoid since
-    # BCE only makes sense for {0,1} targets.
+    # binary indicator fires. Loss stays BCE-with-logits — it accepts soft
+    # targets in [0, 1] and keeps gradients well-conditioned in logit space.
     label_smoothing: bool = False
 
     # Optim
@@ -137,7 +137,7 @@ def _masked_mse(
 
 def _masked_bce_with_logits(
     probe_logits: torch.Tensor,  # [B, T]
-    labels: torch.Tensor,        # [B, T] in {0, 1}
+    labels: torch.Tensor,        # [B, T] in [0, 1] (binary or soft)
     label_mask: torch.Tensor,    # [B, T]
 ) -> torch.Tensor:
     per_token = F.binary_cross_entropy_with_logits(
@@ -333,7 +333,7 @@ def train(cfg: TrainConfig) -> Path:
             out = probe(input_ids=input_ids, attention_mask=attention_mask)
             probe_logits = out["probe_logits"].squeeze(-1)  # [B, T]
 
-            if cfg.ttr_threshold is not None and not cfg.label_smoothing:
+            if cfg.ttr_threshold is not None:
                 loss = _masked_bce_with_logits(probe_logits, labels, label_mask)
             else:
                 loss = _masked_mse(probe_logits, labels, label_mask)
@@ -349,13 +349,13 @@ def train(cfg: TrainConfig) -> Path:
             if use_wandb:
                 import wandb
                 step_loss_name = (
-                    "bce" if cfg.ttr_threshold is not None and not cfg.label_smoothing else "mse"
+                    "bce" if cfg.ttr_threshold is not None else "mse"
                 )
                 wandb.log({f"train/{step_loss_name}": loss.item(), "train/step": global_step})
 
         avg = epoch_loss / max(n_batches, 1)
         loss_name = (
-            "BCE" if cfg.ttr_threshold is not None and not cfg.label_smoothing else "MSE"
+            "BCE" if cfg.ttr_threshold is not None else "MSE"
         )
         log.info("Epoch %d/%d — train %s: %.5f", epoch + 1, cfg.num_epochs, loss_name, avg)
         if use_wandb:
@@ -423,7 +423,7 @@ def train(cfg: TrainConfig) -> Path:
         "model_name": cfg.model_name,
         "probe_layer": layer,
         "lora_layers": lora_layer_indices if cfg.lora_enabled else None,
-        "loss": "BCE" if cfg.ttr_threshold is not None and not cfg.label_smoothing else "MSE",
+        "loss": "BCE" if cfg.ttr_threshold is not None else "MSE",
         "ttr_threshold": cfg.ttr_threshold,
         "label_smoothing": cfg.label_smoothing,
         "trainable_parameters": n_trainable,
